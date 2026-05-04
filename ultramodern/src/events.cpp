@@ -566,10 +566,12 @@ struct GE_ShadowInfo {
 GE_ShadowInfo g_ge_shadow = {};
 
 // 2026-05-04: Address of g_bossGfxDoneMsg in the recompiled GE binary.
-// Learned lazily on first healthy submission so we can heal bogus ones.
+// Hardcoded to 0x803B38B8 (per memory + observed learn event) so the heal works
+// even when the very first submission is bogus. Updated lazily if a different
+// healthy submission shows another value.
 // Layout: OSScTask = { next, state, flags, framebuffer, list:OSTask, msgQ, msg }.
 // OSTask is embedded at offset 0x10, so msg field is at OSScTask base + 0x54.
-static uint32_t g_known_done_msg_ptr = 0;
+static uint32_t g_known_done_msg_ptr = 0x803B38B8;
 #define OSScTask_LIST_OFFSET 0x10
 #define OSScTask_MSG_OFFSET  0x54
 
