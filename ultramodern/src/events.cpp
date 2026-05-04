@@ -565,13 +565,13 @@ struct GE_ShadowInfo {
 };
 GE_ShadowInfo g_ge_shadow = {};
 
-// 2026-05-04: Address of g_bossGfxDoneMsg in the recompiled GE binary.
-// Hardcoded to 0x803B38B8 (per memory + observed learn event) so the heal works
-// even when the very first submission is bogus. Updated lazily if a different
-// healthy submission shows another value.
+// 2026-05-04: Pointer used as the OSScTask.msg replacement when healing.
+// Initially 0 — populated from the FIRST GFX submission whose msg field is a
+// K0 RDRAM pointer. The hardcoded 0x803B38B8 (static `g_bossGfxDoneMsg`) was
+// WRONG: bossMainloop sends `&localGfxDoneMsg` from its stack, not the global.
 // Layout: OSScTask = { next, state, flags, framebuffer, list:OSTask, msgQ, msg }.
 // OSTask is embedded at offset 0x10, so msg field is at OSScTask base + 0x54.
-static uint32_t g_known_done_msg_ptr = 0x803B38B8;
+static uint32_t g_known_done_msg_ptr = 0x803B38B8;  // hardcoded fallback (last known good observed)
 #define OSScTask_LIST_OFFSET 0x10
 #define OSScTask_MSG_OFFSET  0x54
 
@@ -616,21 +616,42 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
         if (sctask_in_rdram) {
             uint32_t cur_msg = *(uint32_t*)(rdram + sctask_phys + OSScTask_MSG_OFFSET);
             bool cur_msg_ok = (cur_msg >= 0x80000000u) && (cur_msg < 0x80800000u);
-            if (cur_msg_ok && orig_ptr >= 0x1000 && orig_ptr < 0x00800000) {
-                // Healthy submission — learn the msg pointer.
+            if (cur_msg_ok) {
+                // Learn from ANY submission whose msg field looks like a K0 RDRAM
+                // pointer — even if data_ptr is bogus. The msg points at the
+                // caller's `&localGfxDoneMsg` (a stack OSScMsg already initialised
+                // with gen.type=OS_SC_DONE_MSG). Gating learning on orig_ptr is
+                // what made the heal non-deterministic across runs: depending on
+                // whether the FIRST submission had a healthy data_ptr, the global
+                // hardcoded 0x803B38B8 (the static `g_bossGfxDoneMsg`, which is
+                // NOT what bossMainloop actually sends) leaked through.
                 if (g_known_done_msg_ptr != cur_msg) {
-                    fprintf(stderr, "[submit_rsp_task] learned good DONE msg ptr=0x%08X (sctask=0x%08X)\n",
-                        cur_msg, ((uint32_t)task_ - OSScTask_LIST_OFFSET));
+                    fprintf(stderr, "[submit_rsp_task] learned DONE msg ptr=0x%08X (sctask=0x%08X data_ptr=0x%08X)\n",
+                        cur_msg, ((uint32_t)task_ - OSScTask_LIST_OFFSET), orig_ptr);
                 }
                 g_known_done_msg_ptr = cur_msg;
+                // Stamp gen.type=OS_SC_DONE_MSG (=2, BE short at offset 0) into
+                // the OSScMsg the pointer references. Defensive: if game-side
+                // memory was clobbered between learn and use, __scTaskComplete
+                // still reads a valid DONE marker. The 32-bit word-swap means
+                // each byte address is XOR'd with 3 in the host buffer.
+                uint32_t msg_phys = cur_msg & 0x3FFFFFF;
+                if (msg_phys + 2 <= 0x00800000) {
+                    rdram[msg_phys ^ 3]       = 0x00;
+                    rdram[(msg_phys + 1) ^ 3] = 0x02;
+                }
             }
-            if ((orig_ptr < 0x1000 || orig_ptr >= 0x00800000) && !cur_msg_ok && g_known_done_msg_ptr != 0) {
-                // Bogus submission with bad msg — heal it.
+            // 2026-05-04 v2 — UNCONDITIONALLY overwrite msg field with known-good
+            // address on EVERY GFX submission. The previous gated heal was fragile:
+            // sometimes bogus tasks had cur_msg in valid range (just not the right
+            // one), bypassing the heal. Now every submit ensures __scTaskComplete
+            // forwards a valid DONE pointer to clientQ.
+            if (g_known_done_msg_ptr != 0) {
                 *(uint32_t*)(rdram + sctask_phys + OSScTask_MSG_OFFSET) = g_known_done_msg_ptr;
                 static int heal_log = 0;
                 if (++heal_log <= 5) {
-                    fprintf(stderr, "[submit_rsp_task] healed bogus sctask msg field 0x%08X -> 0x%08X\n",
-                        cur_msg, g_known_done_msg_ptr);
+                    fprintf(stderr, "[submit_rsp_task] healed sctask msg field 0x%08X -> 0x%08X (orig_ptr=0x%08X)\n",
+                        cur_msg, g_known_done_msg_ptr, orig_ptr);
                 }
             }
         }
