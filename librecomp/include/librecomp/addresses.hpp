@@ -6,9 +6,8 @@
 #include "recomp.h"
 
 namespace recomp {
-    // 512GB (kseg0 size)
-    constexpr size_t mem_size = 512ULL * 1024ULL * 1024ULL;
-    // 4GB (the full address space)
+    // Map the full 4GB address space as R/W
+    constexpr size_t mem_size = 4096ULL * 1024ULL * 1024ULL;
     constexpr size_t allocation_size = 4096ULL * 1024ULL * 1024ULL;
     // We need a place in rdram to hold the PI handles, so pick an address in extended rdram
     constexpr int32_t cart_handle = 0x80800000;

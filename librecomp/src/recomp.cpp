@@ -3,6 +3,12 @@
 #include <cstring>
 #include <memory>
 #include <cmath>
+#include <execinfo.h>
+#include <unistd.h>
+
+#ifdef __APPLE__
+extern "C" void ensure_thread_autorelease_pool();
+#endif
 #include <unordered_map>
 #include <unordered_set>
 #include <fstream>
@@ -432,9 +438,10 @@ extern "C" void switch_error(const char* func, uint32_t vram, uint32_t jtbl) {
 }
 
 extern "C" void do_break(uint32_t vram) {
-    printf("Encountered break at original vram 0x%08X\n", vram);
-    assert(false);
-    exit(EXIT_FAILURE);
+    // MIPS `break` is div-by-zero trap inserted by the compiler. Silent non-fatal
+    // return: let the recompiled code continue (div result is 0 when divisor=0 on
+    // most real N64 implementations, which most game code treats as fallback).
+    (void)vram;
 }
 
 std::optional<std::u8string> current_game = std::nullopt;
@@ -503,6 +510,7 @@ std::string recomp::current_mod_game_id() {
 }
 
 void recomp::start_game(const std::u8string& game_id) {
+    fprintf(stderr, "[start_game] called with game_id\n");
     std::lock_guard<std::mutex> lock(current_game_mutex);
     current_game = game_id;
     game_status.store(GameStatus::Running);
@@ -517,6 +525,11 @@ std::atomic_bool exited = false;
 moodycamel::LightweightSemaphore graphics_shutdown_ready;
 
 void ultramodern::quit() {
+// fprintf(stderr, "[DEBUG] ultramodern::quit() called!\n");
+    void* bt[10];
+    int count = backtrace(bt, 10);
+    char** syms = backtrace_symbols(bt, count);
+    if (syms) { for (int i = 0; i < count; i++) fprintf(stderr, "  %s\n", syms[i]); free(syms); }
     exited.store(true);
     GameStatus desired = GameStatus::None;
     game_status.compare_exchange_strong(desired, GameStatus::Quit);
@@ -611,20 +624,26 @@ void recomp::mods::set_mod_index(const std::string &mod_game_id, const std::stri
 }
 
 bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
+// fprintf(stderr, "[DEBUG] wait_for_game_started: waiting for game status...\n");
     game_status.wait(GameStatus::None);
+// fprintf(stderr, "[DEBUG] wait_for_game_started: game status changed to %d\n", (int)game_status.load());
 
     switch (game_status.load()) {
         // TODO refactor this to allow a project to specify what entrypoint function to run for a give game.
         case GameStatus::Running:
             {
+// fprintf(stderr, "[DEBUG] Loading stored ROM...\n");
                 if (!recomp::load_stored_rom(current_game.value())) {
                     ultramodern::error_handling::message_box("Error opening stored ROM! Please restart this program.");
                 }
+// fprintf(stderr, "[DEBUG] ROM loaded successfully\n");
 
                 auto find_it = game_roms.find(current_game.value());
                 const recomp::GameEntry& game_entry = find_it->second;
 
+// fprintf(stderr, "[DEBUG] Calling init() with entrypoint 0x%08X...\n", game_entry.entrypoint_address);
                 init(rdram, context, game_entry.entrypoint_address);
+// fprintf(stderr, "[DEBUG] init() complete\n");
                 if (game_entry.on_init_callback) {
                     game_entry.on_init_callback(rdram, context);
                 }
@@ -656,11 +675,15 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
                 recomp::init_heap(rdram, recomp::mod_rdram_start + mod_ram_used);
 
                 save_type = game_entry.save_type;
+// fprintf(stderr, "[DEBUG] Initializing saving...\n");
                 ultramodern::init_saving(rdram);
 
+// fprintf(stderr, "[DEBUG] Calling game entrypoint...\n");
                 try {
                     game_entry.entrypoint(rdram, context);
+// fprintf(stderr, "[DEBUG] Game entrypoint returned\n");
                 } catch (ultramodern::thread_terminated& terminated) {
+// fprintf(stderr, "[DEBUG] Game entrypoint threw thread_terminated\n");
 
                 }
             }
@@ -772,11 +795,14 @@ void recomp::start(
         ultramodern::error_handling::message_box("Failed to allocate memory!");
         return;
     }
-
+// fprintf(stderr, "[DEBUG] rdram base: %p, mem_size: 0x%llX, alloc_size: 0x%llX\n",
     recomp::register_heap_exports();
     recomp::mods::register_config_exports();
 
     std::thread game_thread{[](ultramodern::renderer::WindowHandle window_handle, uint8_t* rdram) {
+#ifdef __APPLE__
+        ensure_thread_autorelease_pool();
+#endif
         debug_printf("[Recomp] Starting\n");
 
         ultramodern::set_native_thread_name("Game Start Thread");

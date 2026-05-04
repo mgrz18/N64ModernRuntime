@@ -182,7 +182,14 @@ void ultramodern::resume_thread_and_wait(RDRAM_ARG OSThread *t) {
     wait_for_resumed(PASS_RDRAM cur_context);
 }
 
+#ifdef __APPLE__
+extern "C" void ensure_thread_autorelease_pool();
+#endif
+
 static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entrypoint, PTR(void) arg, UltraThreadContext* thread_context) {
+#ifdef __APPLE__
+    ensure_thread_autorelease_pool();
+#endif
     OSThread *self = TO_PTR(OSThread, self_);
     debug_printf("[Thread] Thread created: %d\n", self->id);
     thread_self = self_;
@@ -342,6 +349,9 @@ static moodycamel::BlockingConcurrentQueue<UltraThreadContext*> deleted_threads{
 extern std::atomic_bool exited;
 
 void thread_cleaner_func() {
+#ifdef __APPLE__
+    ensure_thread_autorelease_pool();
+#endif
     using namespace std::chrono_literals;
     while (!exited) {
         UltraThreadContext* to_delete;

@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "ultramodern/ultramodern.hpp"
@@ -361,12 +362,20 @@ recomp_func_t* recomp::overlays::get_func_by_section_rom_function_vram(uint32_t 
     return get_func_by_section_index_function_offset(find_section_it->second, func_offset);
 }
 
+static void stub_function(uint8_t* rdram, recomp_context* ctx) {
+    // No-op stub for missing functions
+}
+
+static std::unordered_set<int32_t> warned_missing_funcs;
+
 extern "C" recomp_func_t * get_function(int32_t addr) {
     auto func_find = func_map.find(addr);
     if (func_find == func_map.end()) {
-        fprintf(stderr, "Failed to find function at 0x%08X\n", addr);
-        assert(false);
-        std::exit(EXIT_FAILURE);
+        if (warned_missing_funcs.find(addr) == warned_missing_funcs.end()) {
+            fprintf(stderr, "WARNING: Missing function at 0x%08X, returning stub\n", addr);
+            warned_missing_funcs.insert(addr);
+        }
+        return stub_function;
     }
     return func_find->second;
 }

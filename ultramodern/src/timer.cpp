@@ -64,7 +64,14 @@ uint64_t time_now() {
     return duration_to_ticks(std::chrono::high_resolution_clock::now() - start_time);
 }
 
+#ifdef __APPLE__
+extern "C" void ensure_thread_autorelease_pool();
+#endif
+
 void timer_thread(RDRAM_ARG1) {
+#ifdef __APPLE__
+    ensure_thread_autorelease_pool();
+#endif
     ultramodern::set_native_thread_name("Timer Thread");
     ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::VeryHigh);
 

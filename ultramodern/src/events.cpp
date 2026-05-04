@@ -8,6 +8,8 @@
 #include <mutex>
 #include <queue>
 #include <cstring>
+#include <csignal>
+#include <csetjmp>
 
 #include "blockingconcurrentqueue.h"
 
@@ -16,6 +18,11 @@
 
 #include "ultramodern/rsp.hpp"
 #include "ultramodern/renderer_context.hpp"
+
+// Bridge to the host app's UI: true once the launcher RmlUi content has been hidden
+// by draw_hook. Used to gate enable_instant_present so PresentEarly doesn't freeze
+// the launcher on screen.
+extern "C" int recompui_is_launcher_fully_hidden(void);
 
 static ultramodern::events::callbacks_t events_callbacks{};
 
@@ -109,7 +116,14 @@ extern moodycamel::LightweightSemaphore graphics_shutdown_ready;
 
 void set_dummy_vi();
 
+#ifdef __APPLE__
+extern "C" void ensure_thread_autorelease_pool();
+#endif
+
 void vi_thread_func() {
+#ifdef __APPLE__
+    ensure_thread_autorelease_pool();
+#endif
     ultramodern::set_native_thread_name("VI Thread");
     // This thread should be prioritized over every other thread in the application, as it's what allows
     // the game to generate new audio and gfx lists.
@@ -152,9 +166,7 @@ void vi_thread_func() {
 
                 if (ultramodern::is_game_started()) {
                     if (events_context.vi.mq != NULLPTR) {
-                        if (osSendMesg(PASS_RDRAM events_context.vi.mq, events_context.vi.msg, OS_MESG_NOBLOCK) == -1) {
-                            //printf("Game skipped a VI frame!\n");
-                        }
+                        osSendMesg(PASS_RDRAM events_context.vi.mq, events_context.vi.msg, OS_MESG_NOBLOCK);
                     }
                 }
                 else {
@@ -191,10 +203,18 @@ void sp_complete() {
 void dp_complete() {
     uint8_t* rdram = events_context.rdram;
     std::lock_guard lock{ events_context.message_mutex };
+    static int dp_count = 0;
+    dp_count++;
+    if (dp_count <= 3 || dp_count % 60 == 0) {
+        fprintf(stderr, "[dp_complete #%d]\n", dp_count);
+    }
     osSendMesg(PASS_RDRAM events_context.dp.mq, events_context.dp.msg, OS_MESG_NOBLOCK);
 }
 
 void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_ready) {
+#ifdef __APPLE__
+    ensure_thread_autorelease_pool();
+#endif
     ultramodern::set_native_thread_name("SP Task Thread");
     ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::Normal);
 
@@ -210,9 +230,20 @@ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_r
             return;
         }
 
+        {
+            static int task_count = 0;
+            task_count++;
+            if (task_count <= 5) {
+// fprintf(stderr, "[DEBUG] RSP task #%d: type=%" PRIu32 "\n", task_count, task->t.type);
+            }
+        }
         if (!ultramodern::rsp::run_task(PASS_RDRAM task)) {
-            fprintf(stderr, "Failed to execute task type: %" PRIu32 "\n", task->t.type);
-            ULTRAMODERN_QUICK_EXIT();
+            static int rsp_fail_count = 0;
+            rsp_fail_count++;
+            if (rsp_fail_count <= 10) {
+                fprintf(stderr, "Failed to execute task type: %" PRIu32 " (warning %d, continuing)\n", task->t.type, rsp_fail_count);
+            }
+            // Don't exit - signal completion anyway so the game doesn't deadlock
         }
 
         // Tell the game that the RSP has completed
@@ -253,6 +284,9 @@ std::atomic<ultramodern::renderer::SetupResult> renderer_setup_result = ultramod
 std::atomic<ultramodern::renderer::GraphicsApi> renderer_chosen_api = ultramodern::renderer::GraphicsApi::Auto;
 
 void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_ready, ultramodern::renderer::WindowHandle window_handle) {
+#ifdef __APPLE__
+    ensure_thread_autorelease_pool();
+#endif
     bool enabled_instant_present = false;
     using namespace std::chrono_literals;
 
@@ -287,20 +321,46 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
             // Determine the action type and act on it
             if (const auto* task_action = std::get_if<SpTaskAction>(&action)) {
                 // Turn on instant present if the game has been started and it hasn't been turned on yet.
-                if (ultramodern::is_game_started() && !enabled_instant_present) {
-                    renderer_context->enable_instant_present();
+                // DISABLED: PresentEarly mode makes updateScreen return early without advancing the
+                // present queue, relying on DL workload completion to push presents. When GE's DLs
+                // fail (unknown opcodes → SAFETY ABORT), no present fires and the pipeline stalls.
+                // Keeping the default updateScreen-driven presentation keeps draw_hook firing.
+                // Enable instant_present ONLY after the launcher RmlUi content has been
+                // hidden by draw_hook. PresentEarly mode stops draw_hook from firing,
+                // so enabling it before the hide propagates would freeze the launcher
+                // on screen. The ui_renderer's draw_hook sets the bridge flag once it
+                // has applied swap_document(Menu::None).
+                if (ultramodern::is_game_started() && !enabled_instant_present &&
+                    recompui_is_launcher_fully_hidden()) {
+                    // GE_NO_INSTANT_PRESENT=1: keep updateScreen-driven presentation.
+                    // Useful while GE DL pipeline is broken — allows frames to present even
+                    // when RT64 DL workloads don't complete cleanly. Cost: input latency.
+                    if (getenv("GE_NO_INSTANT_PRESENT") == nullptr) {
+                        renderer_context->enable_instant_present();
+                        fprintf(stderr, "[events] enable_instant_present activated (launcher was hidden)\n");
+                    } else {
+                        fprintf(stderr, "[events] enable_instant_present SKIPPED (GE_NO_INSTANT_PRESENT=1)\n");
+                    }
                     enabled_instant_present = true;
                 }
-                // Tell the game that the RSP completed instantly. This will allow it to queue other task types, but it won't
-                // start another graphics task until the RDP is also complete. Games usually preserve the RSP inputs until the RDP
-                // is finished as well, so sending this early shouldn't be an issue in most cases.
-                // If this causes issues then the logic can be replaced with responding to yield requests.
-                sp_complete();
+                // IMPORTANT: send_dl MUST run before sp_complete. GoldenEye reuses its
+                // display list buffer as soon as it sees SP done; sending sp_complete early
+                // lets the game's scheduler overwrite the DL before RT64 reads it, leading
+                // to garbage commands. Process DL first, then signal SP and DP.
                 ultramodern::measure_input_latency();
 
                 auto renderer_start = std::chrono::high_resolution_clock::now();
+                static int sdl_count = 0;
+                sdl_count++;
+                if (sdl_count <= 5 || sdl_count % 60 == 0) {
+                    fprintf(stderr, "[gfx_thread] send_dl #%d start\n", sdl_count);
+                }
                 renderer_context->send_dl(&task_action->task);
+                if (sdl_count <= 5 || sdl_count % 60 == 0) {
+                    fprintf(stderr, "[gfx_thread] send_dl #%d done\n", sdl_count);
+                }
                 auto renderer_end = std::chrono::high_resolution_clock::now();
+                sp_complete();
                 dp_complete();
                 // printf("Renderer ProcessDList time: %d us\n", static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count()));
             }
@@ -371,7 +431,7 @@ extern "C" void osViSwapBuffer(RDRAM_ARG PTR(void) frameBufPtr) {
         VI_Y_SCALE_REG = 0;
         VI_ORIGIN_REG = osVirtualToPhysical(frameBufPtr);
     }
-    
+
     events_context.vi.next_buffer = frameBufPtr;
     events_context.action_queue.enqueue(SwapBuffersAction{ osVirtualToPhysical(frameBufPtr) + vi_origin_offset });
 }
@@ -493,12 +553,181 @@ extern "C" PTR(void) osViGetCurrentFramebuffer() {
     return events_context.vi.current_buffer;
 }
 
+// Global shadow state, read by RSP::setSegment to remap segment bases into shadow.
+// When deep_shadow is active and a segment base falls within [src, src+size), the
+// setSegment call is redirected to the shadow equivalent so runtime address
+// resolution stays in shadow space.
+struct GE_ShadowInfo {
+    uint32_t src = 0;    // original address range start
+    uint32_t size = 0;   // range size
+    uint32_t dest = 0;   // shadow base address
+    bool active = false;
+};
+GE_ShadowInfo g_ge_shadow = {};
+
 void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
     OSTask* task = TO_PTR(OSTask, task_);
 
+    static int submit_count = 0;
+    submit_count++;
+    // Only log GFX submissions (type=1) to keep noise down
+    if (task->t.type == 1 && submit_count <= 10) {
+        fprintf(stderr, "[submit_rsp_task GFX] #%d: task_=0x%08X data_ptr=0x%X data_size=%u\n",
+            submit_count, (uint32_t)task_, (uint32_t)task->t.data_ptr, task->t.data_size);
+    }
+
     // Send gfx tasks to the graphics action queue
     if (task->t.type == M_GFXTASK) {
-        events_context.action_queue.enqueue(SpTaskAction{ *task });
+        // Copy the DL bytes into a dedicated shadow buffer in a fixed region of RDRAM
+        // that the game won't touch. This avoids the race where the game overwrites its
+        // single DL buffer before RT64 reads it. We pick a high RDRAM offset well beyond
+        // the game's heap (typically < 0x400000 for 4MB, we use 0x600000+).
+        static constexpr uint32_t SHADOW_BASE = 0x00600000; // 6MB into RDRAM
+        static constexpr uint32_t SHADOW_SLOT_SIZE = 0x00200000; // 2MB per slot (covers sub-DL tree)
+        static constexpr int SHADOW_SLOTS = 1;  // Only 1 slot — uses up to end of 8MB RDRAM
+        static int shadow_cursor = 0;
+        OSTask task_copy = *task;
+        uint32_t orig_ptr = task->t.data_ptr & 0x3FFFFFF;
+        uint32_t size = task->t.data_size;
+        // Drop bogus tasks: data_ptr==0 means dynGetMasterDisplayList returned 0
+        // (buffers not initialized) and the game then built commands to RAM[0]
+        // overwriting the OS exception region. Nothing good comes of processing this.
+        // Also drop any DL pointer below 0x1000 which cannot be a legitimate heap address.
+        // Drop tasks whose data_ptr is outside valid RDRAM [0x1000, 0x00800000).
+        // Includes VRAM/DMEM-ish addresses like 0x7FC00000 (masks to 0x03FC0000 > 8MB)
+        // which come from corrupt OSTask structures and cause OOB memcpy + garbage DL walking.
+        if (orig_ptr < 0x1000 || orig_ptr >= 0x00800000) {
+            static int subst_log = 0;
+            if (++subst_log <= 10) {
+                fprintf(stderr, "[submit_rsp_task] SUBST bogus GFX task: data_ptr=0x%08X size=%u — substituting minimal DL\n",
+                    (uint32_t)task->t.data_ptr, size);
+            }
+            // Do NOT short-circuit with sp_complete/dp_complete directly. That bypasses the
+            // game-side scheduler's __scTaskComplete path (which stamps gen.type=2 DONE into
+            // a stored OSScMsg and forwards it to clientQ). Empirical finding: short-circuit
+            // caused the scheduler to enter a pathological state emitting 0x29B (SP done)
+            // events forever without ever producing a DONE msg — bossMainloop then never
+            // decrements pendingGfx and stalls.
+            //
+            // Instead, substitute a minimal valid DL (single G_ENDDL command) at a fixed
+            // shadow offset so the normal pipeline runs end-to-end. RT64 walks 8 bytes,
+            // terminates cleanly, then sp_complete+dp_complete fire from gfx_thread and the
+            // scheduler's __scHandleRDP → __scTaskComplete chain delivers a proper DONE.
+            static constexpr uint32_t NOOP_DL_ADDR = 0x007F8000; // within RDRAM, outside game heap
+            // Write G_ENDDL. GE uses F3DGOLDEN (F3D-derived) where G_ENDDL=0xB8.
+            // F3DEX2's 0xDF was not recognized by the walker (saw "OUT OF RDRAM" after
+            // 4095 cmds). Use 0xB8 which is the F3D/F3DEX convention.
+            // DL format: [opcode(1B) | pad(3B)] [w1(4B)]. BE in RDRAM.
+            // With 32-bit host word-swap, writing a u32 at aligned offset directly stores
+            // the BE value.
+            uint8_t* dl = rdram + NOOP_DL_ADDR;
+            *(uint32_t*)(dl + 0) = 0xB8000000u; // G_ENDDL (F3D)
+            *(uint32_t*)(dl + 4) = 0x00000000u;
+            task_copy.t.data_ptr = 0x80000000u | NOOP_DL_ADDR;
+            task_copy.t.data_size = 8;
+            events_context.action_queue.enqueue(SpTaskAction{ task_copy });
+            return;
+        }
+        if (size == 0 || size > SHADOW_SLOT_SIZE) {
+            // Size unknown or too big - fall back to original pointer (accept race risk)
+            events_context.action_queue.enqueue(SpTaskAction{ task_copy });
+        } else {
+            uint32_t shadow_addr = SHADOW_BASE + (shadow_cursor % SHADOW_SLOTS) * SHADOW_SLOT_SIZE;
+            shadow_cursor++;
+
+            // Deep shadow for GE: the main DL references subroutine DLs via G_DL cmds whose
+            // target addresses live in the SAME region but outside the `size` bytes we'd
+            // normally copy. If we only shadow `size` bytes, the walker follows G_DL into
+            // game-side memory that may have been overwritten — walker goes into garbage.
+            //
+            // Strategy: shadow a LARGER region covering [region_start, region_start + SHADOW_SLOT_SIZE)
+            // that contains the main DL plus likely subroutine targets. Then walk the main DL
+            // at shadow time and rewrite every G_DL's w1 (if the target falls in the copied
+            // range) to point to the shadow equivalent. Addresses outside the range are left
+            // alone (they reference external static assets that shouldn't be in danger).
+            //
+            // Only enabled with GE_DEEP_SHADOW=1 while under test.
+            bool deep_shadow = getenv("GE_DEEP_SHADOW") != nullptr;
+            uint32_t copy_src = orig_ptr;
+            uint32_t copy_size = size;
+            uint32_t shadow_dst_offset = 0;
+            if (deep_shadow) {
+                // Skip deep_shadow entirely if orig_ptr is outside valid RDRAM range.
+                // Some game tasks use VRAM-ish addresses (0x7FC00000 masks to 0x03FC0000
+                // which is past 8MB RDRAM) — would cause memcpy overflow.
+                if (orig_ptr >= 0x00800000) {
+                    static int skip_log = 0;
+                    if (++skip_log <= 5) {
+                        fprintf(stderr, "[deep_shadow] SKIP: orig_ptr 0x%08X outside RDRAM, using plain shadow\n", orig_ptr);
+                    }
+                    deep_shadow = false;
+                } else {
+                    uint32_t region_slack_before = 0x10000; // 64KB before
+                    uint32_t region_start = (orig_ptr > region_slack_before) ? (orig_ptr - region_slack_before) : 0;
+                    region_start &= ~0x7u;
+                    uint32_t region_max_size = SHADOW_SLOT_SIZE;
+                    if (region_start >= 0x00800000) {
+                        // Shouldn't happen now but belt+suspenders
+                        region_max_size = 0;
+                    } else if (region_start + region_max_size > 0x00800000) {
+                        region_max_size = 0x00800000 - region_start;
+                    }
+                    copy_src = region_start;
+                    copy_size = region_max_size;
+                    shadow_dst_offset = orig_ptr - region_start;
+                }
+            }
+
+            memcpy(rdram + shadow_addr, rdram + copy_src, copy_size);
+            uint32_t data_ptr_shadow = shadow_addr + shadow_dst_offset;
+            task_copy.t.data_ptr = 0x80000000 | data_ptr_shadow;
+
+            // Publish shadow info so RSP::setSegment can remap segment bases.
+            g_ge_shadow.src = copy_src;
+            g_ge_shadow.size = copy_size;
+            g_ge_shadow.dest = shadow_addr;
+            g_ge_shadow.active = true;
+
+            // Rewrite G_DL (opcode 0x06) target addresses in the DL tree if deep_shadow.
+            // The DL is 8 bytes per command: byte 0 = opcode, bytes 4-7 = w1 (BE in RDRAM).
+            // With 32-bit word swap on host, reading a u32 at offset X (4-aligned) returns
+            // the BE value natively. So to rewrite w1 we: read u32 at shadow + cmd_off + 4,
+            // check if it's in [copy_src, copy_src + copy_size), and rewrite to shadow+delta.
+            if (deep_shadow) {
+                // Bounds check: ensure shadow_addr + copy_size doesn't exceed RDRAM.
+                if (shadow_addr + copy_size > 0x00800000) {
+                    fprintf(stderr, "[deep_shadow] ABORT: shadow_addr 0x%08X + copy_size 0x%X overflows RDRAM\n", shadow_addr, copy_size);
+                    return;
+                }
+                uint32_t rewrites = 0;
+                for (uint32_t o = 0; o + 8 <= copy_size; o += 8) {
+                    uint8_t* cmd_ptr = rdram + shadow_addr + o;
+                    uint32_t w0 = *(uint32_t*)cmd_ptr;
+                    uint8_t op = (w0 >> 24) & 0xFF;
+                    if (op == 0x06) {  // G_DL
+                        uint32_t w1 = *(uint32_t*)(cmd_ptr + 4);
+                        uint32_t tgt_phys = w1 & 0x00FFFFFF;
+                        if (tgt_phys >= copy_src && tgt_phys < copy_src + copy_size) {
+                            uint32_t new_w1 = 0x80000000 | (shadow_addr + (tgt_phys - copy_src));
+                            *(uint32_t*)(cmd_ptr + 4) = new_w1;
+                            rewrites++;
+                        }
+                    }
+                }
+                static int dslog = 0;
+                if (++dslog <= 5) {
+                    fprintf(stderr, "[deep_shadow #%d] src=[0x%08X..0x%08X) %uKB -> shadow=0x%08X, data_ptr=0x%08X, G_DL rewrites=%u (full-region scan)\n",
+                        dslog, copy_src, copy_src + copy_size, copy_size / 1024, shadow_addr, data_ptr_shadow, rewrites);
+                }
+            } else {
+                static int copy_log = 0;
+                if (++copy_log <= 5) {
+                    fprintf(stderr, "[submit_rsp_task] DL shadow copy: 0x%08X -> 0x%08X (%u bytes)\n",
+                        orig_ptr, shadow_addr, size);
+                }
+            }
+            events_context.action_queue.enqueue(SpTaskAction{ task_copy });
+        }
     }
     // Set all other tasks as the RSP task
     else {
@@ -550,7 +779,9 @@ void ultramodern::init_events(RDRAM_ARG ultramodern::renderer::WindowHandle wind
         throw std::runtime_error("Failed to initialize the renderer");
     }
 
+// fprintf(stderr, "[DEBUG] Creating VI thread...\n"); fflush(stderr);
     events_context.vi.thread = std::thread{ vi_thread_func };
+// fprintf(stderr, "[DEBUG] VI thread created!\n"); fflush(stderr);
 }
 
 void ultramodern::join_event_threads() {

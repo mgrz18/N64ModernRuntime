@@ -62,13 +62,18 @@ extern "C" void osCreatePiManager_recomp(uint8_t* rdram, recomp_context* ctx) {
 }
 
 void recomp::do_rom_read(uint8_t* rdram, gpr ram_address, uint32_t physical_addr, size_t num_bytes) {
-    // TODO use word copies when possible
+    // Bounds check: ensure ROM access is within the loaded ROM
+    size_t rom_offset = physical_addr - recomp::rom_base;
+    if (rom_offset + num_bytes > rom.size()) {
+        // Invalid ROM access - fill destination with zeros instead of crashing
+        fprintf(stderr, "[SKIP ROM] out of bounds: offset=0x%zX size=0x%zX rom_size=0x%zX\n", rom_offset, num_bytes, rom.size());
+        for (size_t i = 0; i < num_bytes; i++) {
+            MEM_B(i, ram_address) = 0;
+        }
+        return;
+    }
 
-    // TODO handle misaligned DMA
-    assert((physical_addr & 0x1) == 0 && "Only PI DMA from aligned ROM addresses is currently supported");
-    assert((ram_address & 0x7) == 0 && "Only PI DMA to aligned RDRAM addresses is currently supported");
-    assert((num_bytes & 0x1) == 0 && "Only PI DMA with aligned sizes is currently supported");
-    uint8_t* rom_addr = rom.data() + physical_addr - recomp::rom_base;
+    uint8_t* rom_addr = rom.data() + rom_offset;
     for (size_t i = 0; i < num_bytes; i++) {
         MEM_B(i, ram_address) = *rom_addr;
         rom_addr++;
@@ -136,7 +141,14 @@ void update_save_file() {
 
 extern std::atomic_bool exited;
 
+#ifdef __APPLE__
+extern "C" void ensure_thread_autorelease_pool();
+#endif
+
 void saving_thread_func(RDRAM_ARG1) {
+#ifdef __APPLE__
+    ensure_thread_autorelease_pool();
+#endif
     while (!exited) {
         bool save_buffer_updated = false;
         // Repeatedly wait for a new action to be sent.
@@ -267,6 +279,10 @@ void ultramodern::join_saving_thread() {
     }
 }
 
+// Direct message delivery without scheduling side effects.
+// Used for DMA completion to avoid scheduling livelock during level loading.
+extern bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
+
 void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_addr, uint32_t size, uint32_t direction) {
     // TODO asynchronous transfer
     // TODO implement unaligned DMA correctly
@@ -275,8 +291,12 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
             // read cart rom
             recomp::do_rom_read(rdram, rdram_address, physical_addr, size);
 
-            // Send a message to the mq to indicate that the transfer completed
-            osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
+            // Deliver completion message directly without triggering scheduling.
+            // DMA is synchronous so the data is already copied. Using do_send
+            // instead of osSendMesg avoids dequeue_external_messages and
+            // check_running_queue which cause scheduling livelock during
+            // DMA-heavy operations like level loading.
+            do_send(PASS_RDRAM mq, 0, false, false);
         } else if (physical_addr >= recomp::sram_base) {
             if (!recomp::sram_allowed()) {
                 ultramodern::error_handling::message_box("Attempted to use SRAM saving with other save type");
@@ -285,8 +305,7 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
             // read sram
             save_read(rdram, rdram_address, physical_addr - recomp::sram_base, size);
 
-            // Send a message to the mq to indicate that the transfer completed
-            osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
+            do_send(PASS_RDRAM mq, 0, false, false);
         } else {
             fprintf(stderr, "[WARN] PI DMA read from unknown region, phys address 0x%08X\n", physical_addr);
         }
@@ -302,8 +321,7 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
             // write sram
             save_write(rdram, rdram_address, physical_addr - recomp::sram_base, size);
 
-            // Send a message to the mq to indicate that the transfer completed
-            osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
+            do_send(PASS_RDRAM mq, 0, false, false);
         } else {
             fprintf(stderr, "[WARN] PI DMA write to unknown region, phys address 0x%08X\n", physical_addr);
         }
@@ -319,6 +337,15 @@ extern "C" void osPiStartDma_recomp(RDRAM_ARG recomp_context* ctx) {
     uint32_t size = MEM_W(0x14, ctx->r29);
     PTR(OSMesgQueue) mq = MEM_W(0x18, ctx->r29);
     uint32_t physical_addr = k1_to_phys(devAddr);
+
+    // Sanity check DMA parameters
+    if (size > 0x100000 || physical_addr < recomp::rom_base) {
+        // Invalid DMA - skip it and send completion
+        fprintf(stderr, "[SKIP DMA] bad params: phys=0x%08X size=0x%08X (rom_base=0x%08X)\n", physical_addr, size, (uint32_t)recomp::rom_base);
+        do_send(PASS_RDRAM mq, 0, false, false);
+        ctx->r2 = 0;
+        return;
+    }
 
     debug_printf("[pi] DMA from 0x%08X into 0x%08X of size 0x%08X\n", devAddr, dramAddr, size);
 

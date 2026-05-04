@@ -1,4 +1,6 @@
 #include "ultramodern/ultramodern.hpp"
+#include <cstdio>
+#include <chrono>
 
 void ultramodern::schedule_running_thread(RDRAM_ARG PTR(OSThread) t_) {
     debug_printf("[Scheduling] Adding thread %d to the running queue\n", TO_PTR(OSThread, t_)->id);
@@ -31,8 +33,8 @@ void ultramodern::check_running_queue(RDRAM_ARG1) {
 
 extern "C" void pause_self(RDRAM_ARG1) {
     while (true) {
-        // Wait until an external message arrives, then allow the next thread to run.
-        ultramodern::wait_for_external_message(PASS_RDRAM1);
+        // Wait with 1ms timeout instead of infinite wait to avoid deadlock
+        ultramodern::wait_for_external_message_timed(PASS_RDRAM1, 1);
         ultramodern::check_running_queue(PASS_RDRAM1);
     }
 }

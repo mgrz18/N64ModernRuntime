@@ -152,6 +152,6 @@ void set_callbacks(
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 #define debug_printf(...)
-//#define debug_printf(...) printf(__VA_ARGS__);
+//#define debug_printf(...) fprintf(stderr, __VA_ARGS__);
 
 #endif
