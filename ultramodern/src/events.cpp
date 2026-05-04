@@ -699,25 +699,70 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
                     fprintf(stderr, "[deep_shadow] ABORT: shadow_addr 0x%08X + copy_size 0x%X overflows RDRAM\n", shadow_addr, copy_size);
                     return;
                 }
+                // 2026-05-04: Extend rewriter to also snapshot G_MTX (0x01),
+                // G_VTX (0x04), and G_MOVEMEM (0x03) targets that fall OUTSIDE the
+                // main shadow region. The data referenced by these commands is
+                // commonly in the game heap (e.g. matrices at ~0x00264500 while
+                // DL is at ~0x00610000) and gets overwritten between submit and
+                // walk, producing garbage. We carve out a "data shadow" at the
+                // tail of the shadow region for these snapshots.
                 uint32_t rewrites = 0;
-                for (uint32_t o = 0; o + 8 <= copy_size; o += 8) {
+                uint32_t data_rewrites = 0;
+                // Use the last 256KB of the shadow region as the data shadow.
+                // Main DL fits in the first SHADOW_SLOT_SIZE - 256KB.
+                const uint32_t DATA_SHADOW_OFFSET = (copy_size > 0x40000) ? (copy_size - 0x40000) : 0;
+                uint32_t data_cursor = 0;  // grows from DATA_SHADOW_OFFSET
+                const uint32_t DATA_SHADOW_LIMIT = 0x40000;  // 256KB cap
+                for (uint32_t o = 0; o + 8 <= copy_size && o < DATA_SHADOW_OFFSET; o += 8) {
                     uint8_t* cmd_ptr = rdram + shadow_addr + o;
                     uint32_t w0 = *(uint32_t*)cmd_ptr;
                     uint8_t op = (w0 >> 24) & 0xFF;
-                    if (op == 0x06) {  // G_DL
-                        uint32_t w1 = *(uint32_t*)(cmd_ptr + 4);
-                        uint32_t tgt_phys = w1 & 0x00FFFFFF;
+                    uint32_t w1 = *(uint32_t*)(cmd_ptr + 4);
+                    uint32_t tgt_phys = w1 & 0x00FFFFFF;
+                    if (op == 0x06) {  // G_DL — rewrite to inside main shadow
                         if (tgt_phys >= copy_src && tgt_phys < copy_src + copy_size) {
                             uint32_t new_w1 = 0x80000000 | (shadow_addr + (tgt_phys - copy_src));
                             *(uint32_t*)(cmd_ptr + 4) = new_w1;
                             rewrites++;
                         }
+                    } else if (op == 0x01 || op == 0x04 || op == 0x03) {  // G_MTX, G_VTX, G_MOVEMEM
+                        // Skip if already inside main shadow (DL referenced).
+                        if (tgt_phys >= copy_src && tgt_phys < copy_src + copy_size) continue;
+                        // Skip out-of-RDRAM addresses.
+                        if (tgt_phys >= 0x00800000) continue;
+                        // Determine how many bytes to snapshot.
+                        // G_MTX: always 64 bytes (per F3D spec).
+                        // G_VTX: F3D format w0 = 0x01_NN_LLLL where LLLL is byte length.
+                        //        F3DEX2 differs but GE is F3D-style per agent.
+                        // G_MOVEMEM: w0 low halfword is length.
+                        uint32_t snap_size = 64;  // default for G_MTX
+                        if (op == 0x04) {
+                            uint32_t len = w0 & 0xFFFF;
+                            // Sanity: vertex commands shouldn't be huge. Cap at 32*16=512.
+                            snap_size = (len > 0 && len <= 512) ? len : 256;
+                        } else if (op == 0x03) {
+                            uint32_t len = w0 & 0xFFFF;
+                            // Cap at 4KB.
+                            snap_size = (len > 0 && len <= 0x1000) ? len : 64;
+                        }
+                        // Round up to 8-byte alignment.
+                        snap_size = (snap_size + 7) & ~7u;
+                        if (data_cursor + snap_size > DATA_SHADOW_LIMIT) continue;  // ran out
+                        if (tgt_phys + snap_size > 0x00800000) continue;  // OOB source
+                        uint32_t dst_off = DATA_SHADOW_OFFSET + data_cursor;
+                        // memcpy_s analog: ensure no overlap (data shadow inside main shadow,
+                        // source is elsewhere — should be fine).
+                        memcpy(rdram + shadow_addr + dst_off, rdram + tgt_phys, snap_size);
+                        uint32_t new_w1 = 0x80000000 | (shadow_addr + dst_off);
+                        *(uint32_t*)(cmd_ptr + 4) = new_w1;
+                        data_cursor += snap_size;
+                        data_rewrites++;
                     }
                 }
                 static int dslog = 0;
                 if (++dslog <= 5) {
-                    fprintf(stderr, "[deep_shadow #%d] src=[0x%08X..0x%08X) %uKB -> shadow=0x%08X, data_ptr=0x%08X, G_DL rewrites=%u (full-region scan)\n",
-                        dslog, copy_src, copy_src + copy_size, copy_size / 1024, shadow_addr, data_ptr_shadow, rewrites);
+                    fprintf(stderr, "[deep_shadow #%d] src=[0x%08X..0x%08X) %uKB -> shadow=0x%08X, data_ptr=0x%08X, G_DL rewrites=%u, MTX/VTX/MMEM rewrites=%u (data %ukB used)\n",
+                        dslog, copy_src, copy_src + copy_size, copy_size / 1024, shadow_addr, data_ptr_shadow, rewrites, data_rewrites, data_cursor / 1024);
                 }
             } else {
                 static int copy_log = 0;
