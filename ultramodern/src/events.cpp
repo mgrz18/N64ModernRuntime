@@ -565,6 +565,14 @@ struct GE_ShadowInfo {
 };
 GE_ShadowInfo g_ge_shadow = {};
 
+// 2026-05-04: Address of g_bossGfxDoneMsg in the recompiled GE binary.
+// Learned lazily on first healthy submission so we can heal bogus ones.
+// Layout: OSScTask = { next, state, flags, framebuffer, list:OSTask, msgQ, msg }.
+// OSTask is embedded at offset 0x10, so msg field is at OSScTask base + 0x54.
+static uint32_t g_known_done_msg_ptr = 0;
+#define OSScTask_LIST_OFFSET 0x10
+#define OSScTask_MSG_OFFSET  0x54
+
 void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
     OSTask* task = TO_PTR(OSTask, task_);
 
@@ -593,6 +601,37 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
         // (buffers not initialized) and the game then built commands to RAM[0]
         // overwriting the OS exception region. Nothing good comes of processing this.
         // Also drop any DL pointer below 0x1000 which cannot be a legitimate heap address.
+        // 2026-05-04 stall fix: heal the OSScTask msg field for bogus submissions.
+        // Compute the enclosing OSScTask pointer (OSTask is embedded at offset 0x10).
+        // On healthy submissions we LEARN the msg field's value (always points to
+        // g_bossGfxDoneMsg which carries gen.type=2 DONE). On bogus submissions
+        // we OVERWRITE the garbage msg field with the learned good value, so
+        // __scTaskComplete forwards a valid DONE to clientQ instead of 0x7FC00000
+        // junk. Without this fix bossMainloop only sees one real DONE per run and
+        // animation stalls.
+        uint32_t sctask_phys = ((uint32_t)task_ - OSScTask_LIST_OFFSET) & 0x3FFFFFF;
+        bool sctask_in_rdram = (sctask_phys + OSScTask_MSG_OFFSET + 4 <= 0x00800000);
+        if (sctask_in_rdram) {
+            uint32_t cur_msg = *(uint32_t*)(rdram + sctask_phys + OSScTask_MSG_OFFSET);
+            bool cur_msg_ok = (cur_msg >= 0x80000000u) && (cur_msg < 0x80800000u);
+            if (cur_msg_ok && orig_ptr >= 0x1000 && orig_ptr < 0x00800000) {
+                // Healthy submission — learn the msg pointer.
+                if (g_known_done_msg_ptr != cur_msg) {
+                    fprintf(stderr, "[submit_rsp_task] learned good DONE msg ptr=0x%08X (sctask=0x%08X)\n",
+                        cur_msg, ((uint32_t)task_ - OSScTask_LIST_OFFSET));
+                }
+                g_known_done_msg_ptr = cur_msg;
+            }
+            if ((orig_ptr < 0x1000 || orig_ptr >= 0x00800000) && !cur_msg_ok && g_known_done_msg_ptr != 0) {
+                // Bogus submission with bad msg — heal it.
+                *(uint32_t*)(rdram + sctask_phys + OSScTask_MSG_OFFSET) = g_known_done_msg_ptr;
+                static int heal_log = 0;
+                if (++heal_log <= 5) {
+                    fprintf(stderr, "[submit_rsp_task] healed bogus sctask msg field 0x%08X -> 0x%08X\n",
+                        cur_msg, g_known_done_msg_ptr);
+                }
+            }
+        }
         // Drop tasks whose data_ptr is outside valid RDRAM [0x1000, 0x00800000).
         // Includes VRAM/DMEM-ish addresses like 0x7FC00000 (masks to 0x03FC0000 > 8MB)
         // which come from corrupt OSTask structures and cause OOB memcpy + garbage DL walking.
