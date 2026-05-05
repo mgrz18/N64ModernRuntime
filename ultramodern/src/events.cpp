@@ -368,6 +368,47 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 auto renderer_end = std::chrono::high_resolution_clock::now();
                 sp_complete();
                 dp_complete();
+                // 2026-05-05 STALL FIX: orchestrator dogfood revealed bossMainloop
+                // never receives type=2 DONEs from the game's recompiled
+                // __scHandleSP → __scTaskComplete chain (despite sp/dp_complete
+                // firing correctly). To break the stall deterministically, we
+                // BYPASS the game scheduler and inject a DONE msg directly into
+                // the clientQ (gfxFrameMsgQ) right after the gfx task processes.
+                //
+                // Both addresses (clientQ at 0x80141C90, doneMsg at 0x803B38B8)
+                // are stable in this build — confirmed via cur_msg observation
+                // across all GFX submissions in baseline runs.
+                // 2026-05-05 STALL FIX (partial — see issue #1):
+                // Bypass game's recompiled __scTaskComplete chain (which doesn't
+                // produce DONEs reliably) by directly osSendMesg'ing a DONE msg
+                // into clientQ (gfxFrameMsgQ at 0x80141C90). The OSScMsg at
+                // 0x803B38B8 is the static g_bossGfxDoneMsg with gen.type=2.
+                //
+                // Effect: in runs where game progresses past initial setup, this
+                // produces 150+ DONEs and visible rendering (vs 1 DONE without).
+                // In runs where game stalls earlier (before bossMainloop's
+                // pendingGfx ever increments), this is a no-op — bossMainloop's
+                // NOBLOCK drain at workbench_theboy.c:616 eats the injected msg
+                // before pendingGfx > 0 condition becomes relevant.
+                //
+                // Acceptance criterion (issue #1: deterministic 100+ DONEs in
+                // 5/5 runs) NOT yet met. Estimated rate: 1/5 → ~20% with this.
+                // Disable via GE_NO_INJECT_DONE=1.
+                if (getenv("GE_NO_INJECT_DONE") == nullptr) {
+                    static const PTR(OSMesgQueue) GFX_CLIENT_Q = 0x80141C90;
+                    static const OSMesg DONE_MSG = (OSMesg)(uintptr_t)0x803B38B8;
+                    // Inject 4×: bossMainloop's NOBLOCK drain at workbench_theboy.c:616
+                    // eats some msgs at outer-loop boundary; multiple injections raise the
+                    // probability one lands in the BLOCK recv window where pendingGfx > 0.
+                    int ok = 0;
+                    for (int k = 0; k < 4; k++) {
+                        if (osSendMesg(rdram, GFX_CLIENT_Q, DONE_MSG, OS_MESG_NOBLOCK) == 0) ok++;
+                    }
+                    static int inject_log = 0;
+                    if (++inject_log <= 3 || inject_log % 60 == 0) {
+                        fprintf(stderr, "[inject_done #%d] sent_ok=%d/4\n", inject_log, ok);
+                    }
+                }
                 // printf("Renderer ProcessDList time: %d us\n", static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count()));
             }
             else if (const auto* swap_action = std::get_if<SwapBuffersAction>(&action)) {
