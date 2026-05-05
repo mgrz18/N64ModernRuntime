@@ -197,6 +197,12 @@ void vi_thread_func() {
 void sp_complete() {
     uint8_t* rdram = events_context.rdram;
     std::lock_guard lock{ events_context.message_mutex };
+    static int sp_count = 0;
+    sp_count++;
+    if (sp_count <= 3 || sp_count % 60 == 0) {
+        fprintf(stderr, "[sp_complete #%d] sp.mq=0x%08X sp.msg=0x%08X\n",
+            sp_count, (uint32_t)events_context.sp.mq, (uint32_t)(uintptr_t)events_context.sp.msg);
+    }
     osSendMesg(PASS_RDRAM events_context.sp.mq, events_context.sp.msg, OS_MESG_NOBLOCK);
 }
 
