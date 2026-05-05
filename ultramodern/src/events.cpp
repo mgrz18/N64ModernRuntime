@@ -641,12 +641,12 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
                     rdram[(msg_phys + 1) ^ 3] = 0x02;
                 }
             }
-            // 2026-05-04 v2 — UNCONDITIONALLY overwrite msg field with known-good
-            // address on EVERY GFX submission. The previous gated heal was fragile:
-            // sometimes bogus tasks had cur_msg in valid range (just not the right
-            // one), bypassing the heal. Now every submit ensures __scTaskComplete
-            // forwards a valid DONE pointer to clientQ.
-            if (g_known_done_msg_ptr != 0) {
+            // 2026-05-05: heal ONLY bogus submissions where cur_msg looks invalid.
+            // Healthy submissions have cur_msg pointing at game's stack-local
+            // OSScMsg (already stamped gen.type=2) — overwriting that with a
+            // hardcoded address corrupts the message flow.
+            bool bogus_task = (orig_ptr < 0x1000 || orig_ptr >= 0x00800000);
+            if ((bogus_task || !cur_msg_ok) && g_known_done_msg_ptr != 0) {
                 *(uint32_t*)(rdram + sctask_phys + OSScTask_MSG_OFFSET) = g_known_done_msg_ptr;
                 static int heal_log = 0;
                 if (++heal_log <= 5) {
